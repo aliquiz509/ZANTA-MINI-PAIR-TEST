@@ -5,788 +5,753 @@ const pino = require("pino");
 const { makeid } = require("./gen-id");
 
 const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  delay,
-  makeCacheableSignalKeyStore,
-  Browsers,
-  jidNormalizedUser
+    default: makeWASocket,
+    useMultiFileAuthState,
+    delay,
+    makeCacheableSignalKeyStore,
+    Browsers,
+    jidNormalizedUser,
+    DisconnectReason
 } = require("@whiskeysockets/baileys");
 
 const router = express.Router();
 
 /* =========================================================
-   MODÈLE DE SESSION
-   ========================================================= */
+   CONFIG
+========================================================= */
+
+const SESSION_DIR = "./sessions";
+const RECONNECT_DELAY = 5000;
+
+if (!fs.existsSync(SESSION_DIR)) {
+    fs.mkdirSync(SESSION_DIR, { recursive: true });
+}
+
+/* =========================================================
+   LOGGER
+========================================================= */
+
+const logger = pino({
+    level: "fatal"
+}).child({
+    level: "fatal"
+});
+
+/* =========================================================
+   SESSION SCHEMA
+========================================================= */
 
 const SessionSchema = new mongoose.Schema({
-  number: {
-    type: String,
-    unique: true
-  },
-  creds: Object,
-  added_at: {
-    type: Date,
-    default: Date.now
-  },
-  updated_at: {
-    type: Date,
-    default: Date.now
-  }
+    number: {
+        type: String,
+        unique: true,
+        index: true
+    },
+
+    creds: {
+        type: Object,
+        required: true
+    },
+
+    added_at: {
+        type: Date,
+        default: Date.now
+    },
+
+    updated_at: {
+        type: Date,
+        default: Date.now
+    }
 });
 
 const Session =
-  mongoose.models.Session ||
-  mongoose.model("Session", SessionSchema);
-
+    mongoose.models.Session ||
+    mongoose.model("Session", SessionSchema);
 
 /* =========================================================
-   OUTILS
-   ========================================================= */
+   SAFE FILE REMOVE
+========================================================= */
 
 function removeFile(filePath) {
-  try {
-    if (fs.existsSync(filePath)) {
-      fs.rmSync(filePath, {
-        recursive: true,
-        force: true
-      });
-    }
-  } catch (error) {
-    console.log(
-      "⚠️ Erreur de nettoyage de session :",
-      error.message
-    );
-  }
-}
-
-function normalizeNumber(number) {
-  return String(number || "").replace(/\D/g, "");
-}
-
-function getText(message) {
-  return (
-    message?.conversation ||
-    message?.extendedTextMessage?.text ||
-    message?.imageMessage?.caption ||
-    message?.videoMessage?.caption ||
-    ""
-  ).trim();
-}
-
-
-/* =========================================================
-   COMMANDES ZANTA-MD
-   ========================================================= */
-
-async function handleCommand(sock, msg) {
-  try {
-    if (!msg || !msg.message) return;
-
-    if (msg.key?.fromMe) return;
-
-    const jid = msg.key?.remoteJid;
-
-    if (!jid || jid === "status@broadcast") return;
-
-    const text = getText(msg.message);
-
-    if (!text.startsWith(".")) return;
-
-    const parts = text
-      .slice(1)
-      .trim()
-      .split(/\s+/);
-
-    const command =
-      (parts.shift() || "").toLowerCase();
-
-    const args = parts;
-
-    const ownerNumber =
-      normalizeNumber(process.env.OWNER_NUMBER);
-
-    const ownerName =
-      process.env.OWNER_NAME ||
-      "Propriétaire de ZANTA-MD";
-
-
-    /* =====================================================
-       .alive
-       ===================================================== */
-
-    if (command === "alive") {
-
-      await sock.sendMessage(jid, {
-        text:
-`╔══════════════════════════════╗
-║        ZANTA-MD ACTIF        ║
-╚══════════════════════════════╝
-
-Le bot est toujours vivant.
-Il fonctionne correctement et reste connecté.
-
-▸ Statut : Actif
-▸ Service : En ligne
-▸ Version : ${process.env.BOT_VERSION || "0.0.1"}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ZANTA-MD • The Future of WhatsApp`
-      });
-
-      return;
-    }
-
-
-    /* =====================================================
-       .ping
-       ===================================================== */
-
-    if (command === "ping") {
-
-      const started = Date.now();
-
-      const sent = await sock.sendMessage(jid, {
-        text:
-          "⏳ Vérification de la connexion..."
-      });
-
-      const latency =
-        Date.now() - started;
-
-      await sock.sendMessage(
-        jid,
-        {
-          text:
-`╔══════════════════════════════╗
-║         ZANTA-MD PING        ║
-╚══════════════════════════════╝
-
-✓ Connexion : Stable
-✓ Latence : ${latency} ms
-✓ Statut : En ligne`
-        },
-        {
-          quoted: sent
+    try {
+        if (fs.existsSync(filePath)) {
+            fs.rmSync(filePath, {
+                recursive: true,
+                force: true
+            });
         }
-      );
-
-      return;
+    } catch (err) {
+        console.log("❌ Session remove error:", err.message);
     }
-
-
-    /* =====================================================
-       .menu / .help
-       ===================================================== */
-
-    if (
-      command === "menu" ||
-      command === "help"
-    ) {
-
-      await sock.sendMessage(jid, {
-        text:
-`╔══════════════════════════════╗
-║          ZANTA-MD           ║
-║       MENU PRINCIPAL        ║
-╚══════════════════════════════╝
-
-┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ INFORMATIONS                 ┃
-┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
-┃ • .alive                     ┃
-┃ • .ping                      ┃
-┃ • .info                      ┃
-┃ • .owner                     ┃
-┃ • .menu                      ┃
-┃ • .help                      ┃
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-
-Bot WhatsApp Multi-Device
-Version : ${process.env.BOT_VERSION || "0.0.1"}
-
-Tapez .menu pour afficher ce menu.`
-      });
-
-      return;
-    }
-
-
-    /* =====================================================
-       .owner
-       ===================================================== */
-
-    if (command === "owner") {
-
-      const numberText =
-        ownerNumber
-          ? `+${ownerNumber}`
-          : "Non configuré";
-
-      await sock.sendMessage(jid, {
-        text:
-`╔══════════════════════════════╗
-║        PROPRIÉTAIRE          ║
-╚══════════════════════════════╝
-
-Nom : ${ownerName}
-Numéro : ${numberText}
-
-Créateur de ZANTA-MD.`
-      });
-
-      return;
-    }
-
-
-    /* =====================================================
-       .info
-       ===================================================== */
-
-    if (command === "info") {
-
-      const botNumber =
-        sock.user?.id
-          ? jidNormalizedUser(
-              sock.user.id
-            ).split("@")[0]
-          : "Inconnu";
-
-      await sock.sendMessage(jid, {
-        text:
-`╔══════════════════════════════╗
-║        INFORMATIONS          ║
-╚══════════════════════════════╝
-
-Nom : ZANTA-MD
-Version : ${process.env.BOT_VERSION || "0.0.1"}
-Numéro : +${botNumber}
-Statut : En ligne
-Mode : Multi-Device
-Base de données : MongoDB
-
-Le bot est actuellement opérationnel.`
-      });
-
-      return;
-    }
-
-
-    /* =====================================================
-       COMMANDE INCONNUE
-       ===================================================== */
-
-    await sock.sendMessage(jid, {
-      text:
-`❌ Commande inconnue.
-
-Utilisez .menu pour voir les commandes disponibles.`
-    });
-
-  } catch (error) {
-
-    console.log(
-      "❌ Erreur lors du traitement d'une commande :",
-      error.message
-    );
-  }
 }
 
+/* =========================================================
+   RUNTIME
+========================================================= */
+
+const botStartTime = Date.now();
+
+function getRuntime() {
+
+    const seconds = Math.floor(
+        (Date.now() - botStartTime) / 1000
+    );
+
+    const days = Math.floor(seconds / 86400);
+
+    const hours = Math.floor(
+        (seconds % 86400) / 3600
+    );
+
+    const minutes = Math.floor(
+        (seconds % 3600) / 60
+    );
+
+    const secs = seconds % 60;
+
+    return `${days}d ${hours}h ${minutes}m ${secs}s`;
+}
 
 /* =========================================================
-   ROUTE DE PAIRING
-   ========================================================= */
+   PAIR ROUTE
+========================================================= */
 
 router.get("/", async (req, res) => {
 
-  const id = makeid();
+    const id = makeid();
 
-  const sessionPath =
-    `./session${id}`;
+    let num = req.query.number;
 
-  let number =
-    normalizeNumber(req.query.number);
-
-
-  /* ---------------- VALIDATION NUMÉRO ---------------- */
-
-  if (!number) {
-
-    return res.status(400).json({
-      code: "❌ Numéro manquant."
-    });
-  }
-
-  if (number.length < 8) {
-
-    return res.status(400).json({
-      code: "❌ Numéro invalide."
-    });
-  }
-
-
-  let socket = null;
-
-  let pairingCodeSent = false;
-
-  let responseSent = false;
-
-  let stopped = false;
-
-  let reconnecting = false;
-
-  let retryCount = 0;
-
-  const MAX_RETRIES = 5;
-
-
-  /* =====================================================
-     RÉPONSE HTTP
-     ===================================================== */
-
-  function sendPairingResponse(data) {
-
-    if (
-      !responseSent &&
-      !res.headersSent
-    ) {
-
-      responseSent = true;
-
-      res.json(data);
-    }
-  }
-
-
-  /* =====================================================
-     CONNEXION WHATSAPP
-     ===================================================== */
-
-  async function startSocket(
-    requestPairingCode = false
-  ) {
-
-    if (stopped) return;
-
-    if (reconnecting) return;
-
-    reconnecting = true;
-
-
-    try {
-
-      const {
-        state,
-        saveCreds
-      } = await useMultiFileAuthState(
-        sessionPath
-      );
-
-
-      const logger =
-        pino({
-          level: "fatal"
+    if (!num) {
+        return res.json({
+            code: "❌ Number Missing"
         });
+    }
 
+    /* Clean phone number */
+    num = String(num).replace(/[^0-9]/g, "");
 
-      socket = makeWASocket({
+    if (num.length < 8) {
+        return res.json({
+            code: "❌ Invalid Number"
+        });
+    }
 
-        auth: {
-          creds: state.creds,
+    const sessionPath = `${SESSION_DIR}/session-${id}`;
 
-          keys:
-            makeCacheableSignalKeyStore(
-              state.keys,
-              logger
-            )
-        },
+    let reconnecting = false;
+    let socket = null;
 
-        printQRInTerminal: false,
+    /* =====================================================
+       START SOCKET
+    ===================================================== */
 
-        logger,
-
-        browser:
-          Browsers.ubuntu("Chrome"),
-
-        markOnlineOnConnect: false,
-
-        generateHighQualityLinkPreview:
-          false
-      });
-
-
-      /* ---------------- SAUVEGARDE CREDENTIALS ---------------- */
-
-      socket.ev.on(
-        "creds.update",
-        saveCreds
-      );
-
-
-      /* =====================================================
-         RÉCEPTION DES MESSAGES / COMMANDES
-         ===================================================== */
-
-      socket.ev.on(
-        "messages.upsert",
-        async ({ messages }) => {
-
-          for (
-            const msg of messages || []
-          ) {
-
-            await handleCommand(
-              socket,
-              msg
-            );
-          }
-        }
-      );
-
-
-      /* =====================================================
-         ÉTAT DE LA CONNEXION
-         ===================================================== */
-
-      socket.ev.on(
-        "connection.update",
-        async (update) => {
-
-          const {
-            connection,
-            lastDisconnect
-          } = update;
-
-
-          /* ---------------- CONNECTING ---------------- */
-
-          if (
-            connection === "connecting"
-          ) {
-
-            console.log(
-              "⏳ Connexion à WhatsApp en cours..."
-            );
-          }
-
-
-          /* ---------------- OPEN ---------------- */
-
-          if (
-            connection === "open"
-          ) {
-
-            reconnecting = false;
-
-            retryCount = 0;
-
-            console.log(
-              "✅ WhatsApp connecté avec succès."
-            );
-
-
-            try {
-
-              const authPath =
-                `${sessionPath}/creds.json`;
-
-
-              if (
-                fs.existsSync(authPath)
-              ) {
-
-                const session =
-                  JSON.parse(
-                    fs.readFileSync(
-                      authPath,
-                      "utf8"
-                    )
-                  );
-
-
-                const userJid =
-                  jidNormalizedUser(
-                    socket.user.id
-                  );
-
-
-                /* -------- MongoDB -------- */
-
-                await Session.findOneAndUpdate(
-
-                  {
-                    number: userJid
-                  },
-
-                  {
-                    number: userJid,
-
-                    creds: session,
-
-                    updated_at:
-                      new Date()
-                  },
-
-                  {
-                    upsert: true,
-
-                    new: true
-                  }
-                );
-
-
-                console.log(
-                  "✅ Session enregistrée dans MongoDB."
-                );
-
-
-                /* -------- MESSAGE DE SUCCÈS -------- */
-
-                const successMessage =
-`╔══════════════════════════════╗
-║       ZANTA-MD CONNECTÉ      ║
-╚══════════════════════════════╝
-
-Connexion réussie.
-
-▸ Statut : En ligne
-▸ Mode : Multi-Device
-▸ Base : MongoDB
-▸ Version : ${process.env.BOT_VERSION || "0.0.1"}
-
-Utilisez .menu pour afficher les commandes.`;
-
-
-                await socket.sendMessage(
-                  userJid,
-                  {
-                    text:
-                      successMessage
-                  }
-                );
-              }
-
-
-            } catch (error) {
-
-              console.log(
-                "❌ Erreur lors de l'enregistrement de la session :",
-                error.message
-              );
-            }
-          }
-
-
-          /* ---------------- CLOSE ---------------- */
-
-          if (
-            connection === "close" &&
-            !stopped
-          ) {
-
-            reconnecting = false;
-
-
-            const statusCode =
-              lastDisconnect
-                ?.error
-                ?.output
-                ?.statusCode;
-
-
-            console.log(
-              `⚠️ Connexion WhatsApp fermée. Code : ${
-                statusCode || "inconnu"
-              }`
-            );
-
-
-            /* -------- 401 -------- */
-
-            if (
-              statusCode === 401
-            ) {
-
-              console.log(
-                "❌ Session WhatsApp invalidée. Un nouveau pairing est nécessaire."
-              );
-
-
-              stopped = true;
-
-              removeFile(
-                sessionPath
-              );
-
-              return;
-            }
-
-
-            /* -------- RECONNEXION -------- */
-
-            if (
-              retryCount <
-              MAX_RETRIES
-            ) {
-
-              retryCount++;
-
-
-              console.log(
-                `🔄 Tentative de reconnexion ${retryCount}/${MAX_RETRIES}...`
-              );
-
-
-              await delay(5000);
-
-
-              if (!stopped) {
-
-                await startSocket(
-                  false
-                );
-              }
-
-
-            } else {
-
-              console.log(
-                "❌ Nombre maximum de tentatives de reconnexion atteint."
-              );
-            }
-          }
-        }
-      );
-
-
-      reconnecting = false;
-
-
-      /* =====================================================
-         CODE DE PAIRING
-         ===================================================== */
-
-      if (
-        requestPairingCode &&
-        !state.creds.registered
-      ) {
-
-        console.log(
-          "⏳ Préparation du code de connexion WhatsApp..."
-        );
-
-
-        /*
-         * On attend que le socket ait
-         * suffisamment de temps pour
-         * établir la connexion.
-         */
-
-        await delay(5000);
-
-
-        if (
-          stopped ||
-          !socket ||
-          pairingCodeSent
-        ) {
-          return;
-        }
-
+    async function startPair() {
 
         try {
 
-          number =
-            normalizeNumber(number);
+            const {
+                state,
+                saveCreds
+            } = await useMultiFileAuthState(sessionPath);
 
+            socket = makeWASocket({
 
-          console.log(
-            "🔑 Demande du code de connexion..."
-          );
+                auth: {
+                    creds: state.creds,
 
+                    keys: makeCacheableSignalKeyStore(
+                        state.keys,
+                        logger
+                    )
+                },
 
-          const code =
-            await socket.requestPairingCode(
-              number
-            );
+                printQRInTerminal: false,
 
+                logger,
 
-          if (!code) {
+                browser: Browsers.ubuntu("Chrome"),
 
-            throw new Error(
-              "WhatsApp n'a retourné aucun code."
-            );
-          }
+                markOnlineOnConnect: false,
 
+                generateHighQualityLinkPreview: false,
 
-          const formattedCode =
-            String(code)
-              .match(/.{1,4}/g)
-              ?.join("-") ||
-            String(code);
-
-
-          pairingCodeSent = true;
-
-
-          console.log(
-            `✅ Code de connexion généré : ${formattedCode}`
-          );
-
-
-          sendPairingResponse({
-            code:
-              formattedCode
-          });
-
-
-        } catch (error) {
-
-          console.log(
-            "❌ Erreur lors de la génération du code :",
-            error.message
-          );
-
-
-          if (!responseSent) {
-
-            sendPairingResponse({
-              code:
-                "❌ Impossible de générer le code. Veuillez réessayer."
+                syncFullHistory: false
             });
-          }
+
+            /* =================================================
+               SAVE CREDENTIALS
+            ================================================= */
+
+            socket.ev.on(
+                "creds.update",
+                async () => {
+
+                    try {
+                        await saveCreds();
+                    } catch (err) {
+                        console.log(
+                            "❌ Credentials save error:",
+                            err.message
+                        );
+                    }
+
+                }
+            );
+
+            /* =================================================
+               PAIRING CODE
+            ================================================= */
+
+            if (!socket.authState.creds.registered) {
+
+                await delay(1500);
+
+                const code =
+                    await socket.requestPairingCode(num);
+
+                const formattedCode =
+                    code?.match(/.{1,4}/g)?.join("-") ||
+                    code;
+
+                if (!res.headersSent) {
+
+                    res.json({
+                        code: formattedCode
+                    });
+
+                }
+            }
+
+            /* =================================================
+               COMMANDS
+            ================================================= */
+
+            const commandStart = Date.now();
+
+            function runtime() {
+
+                const seconds =
+                    Math.floor(
+                        (Date.now() - commandStart) / 1000
+                    );
+
+                const days =
+                    Math.floor(seconds / 86400);
+
+                const hours =
+                    Math.floor(
+                        (seconds % 86400) / 3600
+                    );
+
+                const minutes =
+                    Math.floor(
+                        (seconds % 3600) / 60
+                    );
+
+                const secs = seconds % 60;
+
+                return `${days}d ${hours}h ${minutes}m ${secs}s`;
+            }
+
+            socket.ev.on(
+                "messages.upsert",
+                async ({ messages }) => {
+
+                    try {
+
+                        const msg = messages?.[0];
+
+                        if (!msg?.message) return;
+
+                        if (msg.key?.fromMe) return;
+
+                        const remoteJid =
+                            msg.key?.remoteJid;
+
+                        if (!remoteJid) return;
+
+                        if (
+                            remoteJid ===
+                            "status@broadcast"
+                        ) {
+                            return;
+                        }
+
+                        const text =
+                            msg.message.conversation ||
+                            msg.message.extendedTextMessage?.text ||
+                            msg.message.imageMessage?.caption ||
+                            msg.message.videoMessage?.caption ||
+                            "";
+
+                        const command =
+                            text.trim().toLowerCase();
+
+                        /* =========================
+                           MENU
+                        ========================= */
+
+                        if (command === ".menu") {
+
+                            await socket.sendMessage(
+                                remoteJid,
+                                {
+                                    text:
+`╭━━━〔 𓆩⚡𓆪 〕━━━╮
+┃   ᴢᴀɴᴛᴀ-ᴍᴅ
+┃   ᴡʜᴀᴛꜱᴀᴘᴘ ʙᴏᴛ
+╰━━━━━━━━━━━━━━━╯
+
+╭─〔 ᴄᴏᴍᴍᴀɴᴅs 〕
+│
+│ • .menu
+│ • .alive
+│ • .ping
+│ • .runtime
+│ • .help
+│
+╰━━━━━━━━━━━━━━━╯
+
+> ᴘᴏᴡᴇʀᴇᴅ ʙʏ ᴢᴀɴᴛᴀ ᴏꜰᴄ`
+                                }
+                            );
+
+                            return;
+                        }
+
+                        /* =========================
+                           ALIVE
+                        ========================= */
+
+                        if (command === ".alive") {
+
+                            await socket.sendMessage(
+                                remoteJid,
+                                {
+                                    text:
+`╭━━━〔 𓆩⚡𓆪 〕━━━╮
+┃   ᴢᴀɴᴛᴀ-ᴍᴅ
+╰━━━━━━━━━━━━━━━╯
+
+│ ✓ ʙᴏᴛ : ᴏɴʟɪɴᴇ
+│ ✓ sᴛᴀᴛᴜs : ᴀᴄᴛɪᴠᴇ
+│ ✓ ʀᴜɴᴛɪᴍᴇ : ${runtime()}
+
+> ᴢᴀɴᴛᴀ ᴏꜰᴄ`
+                                }
+                            );
+
+                            return;
+                        }
+
+                        /* =========================
+                           PING
+                        ========================= */
+
+                        if (command === ".ping") {
+
+                            const start =
+                                Date.now();
+
+                            const sent =
+                                await socket.sendMessage(
+                                    remoteJid,
+                                    {
+                                        text:
+                                            "🏓 ᴘɪɴɢ..."
+                                    }
+                                );
+
+                            const latency =
+                                Date.now() - start;
+
+                            await socket.sendMessage(
+                                remoteJid,
+                                {
+                                    text:
+`🏓 ᴘᴏɴɢ!
+
+⚡ ʟᴀᴛᴇɴᴄʏ : ${latency} ms`
+                                }
+                            );
+
+                            return;
+                        }
+
+                        /* =========================
+                           RUNTIME
+                        ========================= */
+
+                        if (command === ".runtime") {
+
+                            await socket.sendMessage(
+                                remoteJid,
+                                {
+                                    text:
+`╭━━━〔 𓆩⚡𓆪 〕━━━╮
+┃   ᴢᴀɴᴛᴀ-ᴍᴅ
+╰━━━━━━━━━━━━━━━╯
+
+⏱️ ʀᴜɴᴛɪᴍᴇ : ${runtime()}
+
+> ᴢᴀɴᴛᴀ ᴏꜰᴄ`
+                                }
+                            );
+
+                            return;
+                        }
+
+                        /* =========================
+                           HELP
+                        ========================= */
+
+                        if (command === ".help") {
+
+                            await socket.sendMessage(
+                                remoteJid,
+                                {
+                                    text:
+`╭━━━〔 𓆩⚡𓆪 〕━━━╮
+┃   ᴢᴀɴᴛᴀ-ᴍᴅ ʜᴇʟᴘ
+╰━━━━━━━━━━━━━━━╯
+
+📚 ᴅɪsᴘᴏɴɪʙʟᴇ ᴄᴏᴍᴍᴀɴᴅs :
+
+┌──────────────
+│ .menu
+│ → Afficher le menu
+│
+│ .alive
+│ → Vérifier le statut du bot
+│
+│ .ping
+│ → Vérifier la latence
+│
+│ .runtime
+│ → Afficher le temps d'activité
+│
+│ .help
+│ → Afficher cette aide
+└──────────────
+
+> ᴘᴏᴡᴇʀᴇᴅ ʙʏ ᴢᴀɴᴛᴀ ᴏꜰᴄ`
+                                }
+                            );
+
+                            return;
+                        }
+
+                    } catch (err) {
+
+                        console.log(
+                            "❌ Command error:",
+                            err.message
+                        );
+
+                    }
+
+                }
+            );
+
+            /* =================================================
+               CONNECTION UPDATE
+            ================================================= */
+
+            socket.ev.on(
+                "connection.update",
+                async (update) => {
+
+                    const {
+                        connection,
+                        lastDisconnect
+                    } = update;
+
+                    /* =========================================
+                       CONNECTED
+                    ========================================= */
+
+                    if (connection === "open") {
+
+                        reconnecting = false;
+
+                        console.log(
+                            "✅ Zanta-MD connected"
+                        );
+
+                        try {
+
+                            const userJid =
+                                jidNormalizedUser(
+                                    socket.user.id
+                                );
+
+                            const authPath =
+                                `${sessionPath}/creds.json`;
+
+                            if (
+                                fs.existsSync(
+                                    authPath
+                                )
+                            ) {
+
+                                const creds =
+                                    JSON.parse(
+                                        fs.readFileSync(
+                                            authPath,
+                                            "utf8"
+                                        )
+                                    );
+
+                                /* =================================
+                                   SAVE TO MONGODB
+                                ================================= */
+
+                                await Session.findOneAndUpdate(
+                                    {
+                                        number: userJid
+                                    },
+
+                                    {
+                                        number: userJid,
+                                        creds: creds,
+                                        updated_at:
+                                            new Date()
+                                    },
+
+                                    {
+                                        upsert: true,
+                                        new: true
+                                    }
+                                );
+
+                                console.log(
+                                    "✅ Session saved to MongoDB:",
+                                    userJid
+                                );
+
+                                /* =================================
+                                   SUCCESS MESSAGE
+                                ================================= */
+
+                                await socket.sendMessage(
+                                    userJid,
+                                    {
+                                        text:
+`╔══════════════════╗
+✨ ZANTA-MD CONNECTED ✨
+╚══════════════════╝
+
+🚀 Status : Connected
+👤 User : ${userJid.split("@")[0]}
+🗄 Database : MongoDB
+
+Your session is securely saved.
+
+Powered by Zanta OFC`
+                                    }
+                                );
+
+                            }
+
+                        } catch (err) {
+
+                            console.log(
+                                "❌ MongoDB session error:",
+                                err.message
+                            );
+
+                        }
+
+                    }
+
+                    /* =========================================
+                       CONNECTION CLOSED
+                    ========================================= */
+
+                    if (connection === "close") {
+
+                        const statusCode =
+                            lastDisconnect
+                                ?.error
+                                ?.output
+                                ?.statusCode;
+
+                        console.log(
+                            "⚠️ Connection closed:",
+                            statusCode
+                        );
+
+                        /* ==============================
+                           LOGGED OUT
+                        ============================== */
+
+                        if (
+                            statusCode ===
+                            DisconnectReason.loggedOut
+                        ) {
+
+                            console.log(
+                                "❌ Session logged out"
+                            );
+
+                            try {
+
+                                const userJid =
+                                    socket.user?.id
+                                        ? jidNormalizedUser(
+                                            socket.user.id
+                                        )
+                                        : null;
+
+                                if (userJid) {
+
+                                    await Session.deleteOne({
+                                        number: userJid
+                                    });
+
+                                }
+
+                            } catch (err) {
+
+                                console.log(
+                                    "❌ MongoDB delete error:",
+                                    err.message
+                                );
+
+                            }
+
+                            removeFile(
+                                sessionPath
+                            );
+
+                            return;
+                        }
+
+                        /* ==============================
+                           RECONNECT
+                        ============================== */
+
+                        if (!reconnecting) {
+
+                            reconnecting = true;
+
+                            console.log(
+                                `🔄 Reconnecting in ${RECONNECT_DELAY / 1000}s...`
+                            );
+
+                            await delay(
+                                RECONNECT_DELAY
+                            );
+
+                            try {
+
+                                await startPair();
+
+                            } catch (err) {
+
+                                reconnecting = false;
+
+                                console.log(
+                                    "❌ Reconnect error:",
+                                    err.message
+                                );
+
+                                await delay(
+                                    RECONNECT_DELAY
+                                );
+
+                                startPair();
+
+                            }
+
+                        }
+
+                    }
+
+                }
+            );
+
+        } catch (err) {
+
+            console.log(
+                "❌ Pair/Socket error:",
+                err.message
+            );
+
+            if (!res.headersSent) {
+
+                res.json({
+                    code:
+                        "❌ Error getting code, try again"
+                });
+
+            }
+
+            /* ==============================
+               SAFE RECONNECT
+            ============================== */
+
+            if (!reconnecting) {
+
+                reconnecting = true;
+
+                await delay(
+                    RECONNECT_DELAY
+                );
+
+                reconnecting = false;
+
+                try {
+                    await startPair();
+                } catch (e) {
+                    console.log(
+                        "❌ Restart error:",
+                        e.message
+                    );
+                }
+
+            }
+
         }
-      }
 
-
-    } catch (error) {
-
-      reconnecting = false;
-
-
-      console.log(
-        "❌ Erreur de connexion WhatsApp :",
-        error.message
-      );
-
-
-      if (!responseSent) {
-
-        sendPairingResponse({
-          code:
-            "❌ Erreur de connexion à WhatsApp. Veuillez réessayer."
-        });
-      }
     }
-  }
 
+    /* =====================================================
+       START
+    ===================================================== */
 
-  /* =====================================================
-     DÉMARRAGE
-     ===================================================== */
+    startPair().catch(err => {
 
-  await startSocket(true);
+        console.log(
+            "❌ Fatal pair error:",
+            err.message
+        );
+
+    });
+
 });
 
+/* =========================================================
+   GLOBAL ANTI-CRASH
+========================================================= */
+
+process.on("uncaughtException", (err) => {
+
+    console.log(
+        "⚠️ Uncaught Exception:",
+        err.message
+    );
+
+});
+
+process.on("unhandledRejection", (reason) => {
+
+    console.log(
+        "⚠️ Unhandled Rejection:",
+        reason
+    );
+
+});
 
 module.exports = router;
