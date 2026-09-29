@@ -9,7 +9,7 @@
     "restart": "pm2 restart xpair"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "npm:gifted-baileys@^2.0.6",
+    "@whiskeysockets/baileys": "github:boss-alix/Alex-baileys",
     "@adiwajshing/keyed-db": "^0.2.4",
     "qrcode": "^1.5.3",
     "awesome-phonenumber": "^2.64.0",
