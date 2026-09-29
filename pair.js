@@ -5,12 +5,12 @@ const pino = require("pino");
 const { makeid } = require("./gen-id");
 
 const {
-default: makeWASocket,
-useMultiFileAuthState,
-delay,
-makeCacheableSignalKeyStore,
-Browsers,
-jidNormalizedUser
+  default: makeWASocket,
+  useMultiFileAuthState,
+  delay,
+  makeCacheableSignalKeyStore,
+  Browsers,
+  jidNormalizedUser
 } = require("@whiskeysockets/baileys");
 
 const router = express.Router();
@@ -18,142 +18,535 @@ const router = express.Router();
 /* ---------------- SESSION SCHEMA ---------------- */
 
 const SessionSchema = new mongoose.Schema({
-number: { type:String, unique:true },
-creds: Object,
-added_at:{ type:Date, default:Date.now }
+  number: {
+    type: String,
+    unique: true
+  },
+  creds: Object,
+  added_at: {
+    type: Date,
+    default: Date.now
+  }
 });
 
-const Session = mongoose.models.Session || mongoose.model("Session", SessionSchema);
+const Session =
+  mongoose.models.Session ||
+  mongoose.model("Session", SessionSchema);
 
 
 /* ---------------- DELETE SESSION FILE ---------------- */
 
-function removeFile(FilePath){
-if(fs.existsSync(FilePath)){
-fs.rmSync(FilePath,{recursive:true,force:true});
+function removeFile(filePath) {
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.rmSync(filePath, {
+        recursive: true,
+        force: true
+      });
+    }
+  } catch (err) {
+    console.log("⚠️ Session cleanup error:", err.message);
+  }
 }
+
+
+/* ---------------- NORMALIZE NUMBER ---------------- */
+
+function normalizeNumber(number) {
+  return String(number || "").replace(/\D/g, "");
 }
 
 
 /* ---------------- PAIR ROUTE ---------------- */
 
-router.get("/", async(req, res) => {
+router.get("/", async (req, res) => {
 
-const id = makeid();
-let num = req.query.number;
+  const id = makeid();
+  const sessionPath = `./session${id}`;
 
-if(!num){
-return res.send({ code: "❌ Number Missing" });
-}
+  let num = normalizeNumber(req.query.number);
 
-// Clean the number - remove non-digits
-num = num.replace(/[^0-9]/g, "");
+  if (!num) {
+    return res.status(400).json({
+      code: "❌ Number Missing"
+    });
+  }
 
-async function startPair(){
+  if (num.length < 8) {
+    return res.status(400).json({
+      code: "❌ Invalid Number"
+    });
+  }
 
-const { state, saveCreds } = await useMultiFileAuthState(`./session${id}`);
+  let socket = null;
+  let finished = false;
+  let pairingRequested = false;
+  let retryCount = 0;
 
-try{
+  const MAX_RETRIES = 3;
 
-const sock = makeWASocket({
-auth:{
-creds: state.creds,
-keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" }))
-},
-printQRInTerminal: false,
-logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-browser: Browsers.ubuntu("Chrome"),
-});
 
-sock.ev.on("creds.update", saveCreds);
+  /* ---------------- SEND RESULT ---------------- */
 
-// Wait for socket to be ready then request pairing code
-if(!sock.authState.creds.registered){
-await delay(1500);
-num = num.replace(/\D/g, "");
-const code = await sock.requestPairingCode(num);
-const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code;
-if(!res.headersSent){
-res.json({ code: formattedCode });
-}
-}
+  function sendResult(data) {
+    if (!res.headersSent) {
+      res.json(data);
+    }
+  }
 
-/* ---------------- CONNECTION UPDATE ---------------- */
 
-sock.ev.on("connection.update", async(update) => {
+  /* ---------------- START PAIR ---------------- */
 
-const { connection, lastDisconnect } = update;
+  async function startPair() {
 
-if(connection === "open"){
+    if (finished) return;
 
-await delay(2000);
+    retryCount++;
 
-try{
+    if (retryCount > MAX_RETRIES) {
 
-const auth_path = `./session${id}/creds.json`;
-const session = JSON.parse(fs.readFileSync(auth_path));
+      console.log("❌ Maximum pairing retries reached");
 
-const user_jid = jidNormalizedUser(sock.user.id);
+      finished = true;
 
-/* -------- SAVE SESSION TO MONGODB -------- */
+      sendResult({
+        code: "❌ WhatsApp connection failed. Please try again."
+      });
 
-await Session.findOneAndUpdate(
-{ number: user_jid },
-{ number: user_jid, creds: session },
-{ upsert: true }
-);
+      removeFile(sessionPath);
 
-console.log("✅ Session saved to MongoDB");
+      return;
+    }
 
-/* -------- SUCCESS MESSAGE -------- */
+    console.log(
+      `🔄 Starting WhatsApp connection (${retryCount}/${MAX_RETRIES})`
+    );
 
-const success_msg = `╔══════════════════╗
+    try {
+
+      const { state, saveCreds } =
+        await useMultiFileAuthState(sessionPath);
+
+
+      const logger = pino({
+        level: "fatal"
+      });
+
+
+      socket = makeWASocket({
+
+        auth: {
+          creds: state.creds,
+
+          keys: makeCacheableSignalKeyStore(
+            state.keys,
+            logger
+          )
+        },
+
+        printQRInTerminal: false,
+
+        logger,
+
+        browser: Browsers.ubuntu("Chrome"),
+
+        markOnlineOnConnect: false,
+
+        generateHighQualityLinkPreview: false
+      });
+
+
+      socket.ev.on(
+        "creds.update",
+        saveCreds
+      );
+
+
+      /* ---------------- CONNECTION UPDATE ---------------- */
+
+      socket.ev.on(
+        "connection.update",
+        async (update) => {
+
+          const {
+            connection,
+            lastDisconnect
+          } = update;
+
+
+          console.log(
+            "📡 WhatsApp connection:",
+            connection || "connecting"
+          );
+
+
+          /* -------- CONNECTION OPEN -------- */
+
+          if (connection === "open") {
+
+            console.log(
+              "✅ WhatsApp connection opened"
+            );
+
+            try {
+
+              await delay(2000);
+
+              const authPath =
+                `${sessionPath}/creds.json`;
+
+
+              if (!fs.existsSync(authPath)) {
+
+                console.log(
+                  "⚠️ creds.json not found"
+                );
+
+                return;
+              }
+
+
+              const session =
+                JSON.parse(
+                  fs.readFileSync(
+                    authPath,
+                    "utf8"
+                  )
+                );
+
+
+              const userJid =
+                jidNormalizedUser(
+                  socket.user.id
+                );
+
+
+              /* -------- SAVE SESSION -------- */
+
+              await Session.findOneAndUpdate(
+
+                {
+                  number: userJid
+                },
+
+                {
+                  number: userJid,
+                  creds: session
+                },
+
+                {
+                  upsert: true,
+                  new: true
+                }
+
+              );
+
+
+              console.log(
+                "✅ Session saved to MongoDB"
+              );
+
+
+              /* -------- SUCCESS MESSAGE -------- */
+
+              const successMsg =
+`╔══════════════════╗
 ✨ ZANTA-MD CONNECTED ✨
 ╚══════════════════╝
 
 🚀 Status : Connected
-👤 User : ${user_jid.split("@")[0]}
+👤 User : ${userJid.split("@")[0]}
 🗄 Database : MongoDB
 
 Your session is securely saved.
 
 Powered by Zanta OFC`;
 
-await sock.sendMessage(user_jid, { text: success_msg });
 
-} catch(err){
-console.log("❌ Save Error", err);
-}
+              try {
 
-await delay(2000);
-removeFile(`./session${id}`);
-process.exit(0);
+                await socket.sendMessage(
+                  userJid,
+                  {
+                    text: successMsg
+                  }
+                );
 
-}
+              } catch (sendError) {
 
-else if(connection === "close"){
+                console.log(
+                  "⚠️ Success message error:",
+                  sendError.message
+                );
 
-if(lastDisconnect?.error?.output?.statusCode !== 401){
-await delay(10000);
-startPair();
-}
+              }
 
-}
+
+              finished = true;
+
+              await delay(2000);
+
+              removeFile(sessionPath);
+
+              try {
+
+                socket.end(
+                  new Error("Pairing completed")
+                );
+
+              } catch (_) {}
+
+
+            } catch (err) {
+
+              console.log(
+                "❌ Session Save Error:",
+                err
+              );
+
+            }
+
+          }
+
+
+          /* -------- CONNECTION CLOSED -------- */
+
+          if (
+            connection === "close" &&
+            !finished
+          ) {
+
+            const statusCode =
+              lastDisconnect?.error?.output?.statusCode;
+
+            console.log(
+              "❌ WhatsApp connection closed. Status:",
+              statusCode
+            );
+
+
+            /*
+             * 401 = Logged out / unauthorized.
+             * Do not retry indefinitely.
+             */
+
+            if (statusCode === 401) {
+
+              finished = true;
+
+              sendResult({
+                code: "❌ WhatsApp session unauthorized. Try again."
+              });
+
+              removeFile(sessionPath);
+
+              return;
+            }
+
+
+            /*
+             * 428 = Connection Closed.
+             * Retry the socket instead of immediately
+             * returning an error to the user.
+             */
+
+            if (statusCode === 428) {
+
+              console.log(
+                "⚠️ WhatsApp returned 428. Retrying..."
+              );
+
+            }
+
+
+            if (retryCount < MAX_RETRIES) {
+
+              await delay(4000);
+
+              if (!finished) {
+                await startPair();
+              }
+
+            } else {
+
+              finished = true;
+
+              sendResult({
+                code: "❌ Connection closed. Please try again."
+              });
+
+              removeFile(sessionPath);
+
+            }
+
+          }
+
+        }
+      );
+
+
+      /* ------------------------------------------------
+         WAIT BEFORE REQUESTING PAIRING CODE
+         ------------------------------------------------ */
+
+      if (!state.creds.registered) {
+
+        /*
+         * IMPORTANT:
+         * Do not request the pairing code immediately.
+         * The WhatsApp WebSocket needs time to initialize.
+         */
+
+        console.log(
+          "⏳ Waiting for WhatsApp socket..."
+        );
+
+        await delay(5000);
+
+
+        if (
+          finished ||
+          !socket
+        ) {
+          return;
+        }
+
+
+        /*
+         * Prevent duplicate pairing-code requests.
+         */
+
+        if (pairingRequested) {
+          return;
+        }
+
+        pairingRequested = true;
+
+
+        try {
+
+          num = normalizeNumber(num);
+
+          console.log(
+            "🔑 Requesting pairing code for:",
+            num
+          );
+
+
+          const code =
+            await socket.requestPairingCode(num);
+
+
+          if (!code) {
+
+            throw new Error(
+              "WhatsApp returned an empty pairing code"
+            );
+
+          }
+
+
+          const formattedCode =
+            String(code)
+              .match(/.{1,4}/g)
+              ?.join("-") || code;
+
+
+          console.log(
+            "✅ Pairing code generated:",
+            formattedCode
+          );
+
+
+          sendResult({
+            code: formattedCode
+          });
+
+
+        } catch (pairError) {
+
+          pairingRequested = false;
+
+          console.log(
+            "❌ Pairing Code Error:",
+            pairError?.message || pairError
+          );
+
+
+          /*
+           * If the socket closed while requesting
+           * the code, let connection.update handle retry.
+           */
+
+          if (
+            String(pairError?.message || "")
+              .toLowerCase()
+              .includes("connection closed")
+          ) {
+
+            console.log(
+              "🔄 Connection closed during pairing. Waiting for retry..."
+            );
+
+            return;
+          }
+
+
+          finished = true;
+
+          sendResult({
+            code: "❌ Error getting pairing code. Please try again."
+          });
+
+          removeFile(sessionPath);
+
+        }
+
+      }
+
+    } catch (err) {
+
+      console.log(
+        "❌ Pair Error:",
+        err
+      );
+
+
+      if (
+        !finished &&
+        retryCount < MAX_RETRIES
+      ) {
+
+        await delay(4000);
+
+        await startPair();
+
+        return;
+      }
+
+
+      if (!finished) {
+
+        finished = true;
+
+        sendResult({
+          code: "❌ Error starting WhatsApp connection."
+        });
+
+        removeFile(sessionPath);
+
+      }
+
+    }
+
+  }
+
+
+  /* ---------------- START ---------------- */
+
+  await startPair();
 
 });
 
-} catch(err){
-console.log("❌ Pair Error:", err);
-removeFile(`./session${id}`);
-if(!res.headersSent){
-res.json({ code: "❌ Error getting code, try again" });
-}
-}
-
-}
-
-startPair();
-
-});
 
 module.exports = router;
